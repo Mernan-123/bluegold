@@ -453,9 +453,9 @@ LOGIN_HTML = """
    <p class="muted" style="margin:0 0 26px">Administrator access for the security training simulator.</p>
    {% if error %}<div class="alert err">{{icon('alert')}}<div>{{error}}</div></div>{% endif %}
    {% if notice %}<div class="alert ok">{{icon('shield')}}<div>{{notice}}</div></div>{% endif %}
-   <form method="post" id="f" autocomplete="on">
+   <form method="post" id="f" autocomplete="off">
     <div class="field"><label for="u">Username or work email</label>
-     <input id="u" name="username" required autofocus autocomplete="username" placeholder="name@bluegold-lab.local" value="{{last_user}}"></div>
+     <input id="u" name="username" required autofocus autocomplete="off" placeholder="name@bluegold-lab.local"></div>
     <div class="field"><label for="p">Password</label>
      <div class="pw"><input id="p" name="password" type="password" required autocomplete="current-password" placeholder="Enter your password">
       <button type="button" onclick="const p=document.getElementById('p');p.type=p.type==='password'?'text':'password'" aria-label="Show password">{{icon('eye')}}</button></div></div>
@@ -473,9 +473,9 @@ LOGIN_HTML = """
 <script>document.getElementById('f').addEventListener('submit',()=>{const b=document.getElementById('go');b.classList.add('loading');b.querySelector('.lbl').textContent='Signing in…'});</script>"""
 
 
-def login_page(error=None, notice=None, last_user=""):
+def login_page(error=None, notice=None):
     return page(f"Sign in – {COMPANY}", LOGIN_HTML, css=CORP_CSS + LOGIN_CSS + BANK_LOGIN_THEME, body_class="corp",
-                error=error, notice=notice, last_user=last_user)
+                error=error, notice=notice)
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -497,7 +497,7 @@ def login():
                 log_attempt(None, "unknown_user")
                 error = "Your username or password is incorrect. Please try again."
             elif not check_password_hash(user["password_hash"], password):
-                log_attempt(None, "wrong_password")
+                log_attempt(user["username"], "wrong_password")
                 error = "Your username or password is incorrect. Please try again."
             else:
                 log_attempt(username, "success")
@@ -505,7 +505,7 @@ def login():
                 session["user_id"], session["username"], session["is_admin"] = \
                     user["id"], user["username"], bool(user["is_admin"])
                 return redirect(url_for("admin" if user["is_admin"] else "dashboard"))
-    return login_page(error=error, last_user=username)
+    return login_page(error=error)
 
 
 @app.route("/forgot")
@@ -674,6 +674,7 @@ WORKSPACE_CSS = """<style>
  .audit .ledger{background:#fff;border:1px solid #dce3ed;border-radius:12px;min-width:0}
  .audit .ledger-head,.audit .ledger-foot{display:flex;gap:12px;justify-content:space-between;align-items:center;flex-wrap:wrap;padding:14px 16px}
  .audit .ledger-head h2{margin:0;font-size:17px}
+ .audit th,.audit td{white-space:normal;overflow-wrap:anywhere}
  .audit table{width:100%;border-collapse:collapse;text-align:left}
  .audit th,.audit td{padding:13px 16px;border-bottom:1px solid #e4eaf2;color:#14223a}
  .audit th{background:#e9eef6;color:#40526a}
@@ -998,19 +999,22 @@ def logs():
       <section class="ledger" aria-labelledby="attempt-results">
        <div class="ledger-head"><h2 id="attempt-results">Attempt history</h2><span class="muted">{{count}} matching {{'event' if count==1 else 'events'}}</span></div>
        <div class="wrap" tabindex="0" role="region" aria-label="Sign-in attempts table"><table>
-        <thead><tr><th scope="col">Time (UTC)</th><th scope="col">Outcome</th><th scope="col">Account</th><th scope="col">Source IP</th><th scope="col">Location</th><th scope="col">ISP</th><th scope="col">MAC address</th><th scope="col">Reported device</th></tr></thead>
+        <thead><tr><th scope="col">Timestamp (UTC)</th><th scope="col">Result</th><th scope="col">Username</th><th scope="col">IP address</th><th scope="col">Country</th><th scope="col">Region</th><th scope="col">City</th><th scope="col">Street</th><th scope="col">Map</th><th scope="col">ISP</th><th scope="col">MAC address</th><th scope="col">Reported browser / OS</th></tr></thead>
         <tbody>{% for r in rows %}<tr>
          <td><time datetime="{{r.created_at}}">{{r.created_at.replace('T',' ')[:19]}}</time></td>
          {% set label = labels.get(r.result, ('Other', 'warn')) %}
          <td><span class="tag {{label[1]}}">{{label[0]}}</span></td>
-         <td>{{r.username or '—'}}</td><td><code>{{r.ip or '—'}}</code></td>
-         <td>{% if r.ip in ('127.0.0.1', '::1') %}This computer{% else %}{{[r.city,r.region,r.country]|select|join(', ') or 'Unavailable'}}{% endif %}
-          {% if r.lat is number and r.lon is number %}<small><a class="audit-link" rel="noopener noreferrer" target="_blank"
-             href="https://www.openstreetmap.org/?mlat={{r.lat}}&mlon={{r.lon}}#map=11/{{r.lat}}/{{r.lon}}">Open map</a></small>{% endif %}</td>
+         <td>{{r.username or 'Unidentified account'}}</td><td><code>{{r.ip or 'IP unavailable'}}</code></td>
+         <td>{{r.country or 'Country unavailable'}}</td>
+         <td>{{r.region or ('Local connection' if r.country == 'Local network' else 'Region unavailable')}}</td>
+         <td>{{r.city or ('Local connection' if r.country == 'Local network' else 'City unavailable')}}</td>
+         <td class="muted">Street not determined</td>
+         <td>{% if r.lat is number and r.lon is number %}<a class="audit-link" rel="noopener noreferrer" target="_blank"
+             href="https://www.openstreetmap.org/?mlat={{r.lat}}&mlon={{r.lon}}#map=11/{{r.lat}}/{{r.lon}}">Open map</a>{% else %}No coordinates{% endif %}</td>
          <td>{{r.isp or ('Local connection' if r.country == 'Local network' else 'Unavailable')}}</td>
-         <td class="muted" title="Web requests do not include a device MAC address">Unavailable</td>
-         <td>{{r.device or 'Unavailable'}}</td>
-        </tr>{% else %}<tr><td colspan="8" class="empty">
+         <td class="muted" title="Web requests do not include a device MAC address">Not sent by browser</td>
+         <td>{{r.device or 'Not reported'}}</td>
+        </tr>{% else %}<tr><td colspan="12" class="empty">
         {% if query or outcome %}No attempts match these filters.{% else %}No sign-in attempts have been recorded yet.{% endif %}
         </td></tr>{% endfor %}</tbody>
        </table></div>
