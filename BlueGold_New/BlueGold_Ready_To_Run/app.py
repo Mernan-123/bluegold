@@ -1,14 +1,30 @@
-"""BlueGold SecureAccess sign-in and security monitoring lab."""
+"""
+Login system with brute-force protection, a decoy (honeypot) console,
+and an admin security dashboard with a live map of login attempts.
 
+Branding uses a made-up company, "BlueGold Group", so the site looks like a
+real business portal. Change COMPANY / PRODUCT below to rename it.
+
+Three separate dashboards:
+  /dashboard  - normal users: account page + their own recent sign-ins
+  /admin      - admin only: dark security-monitoring dashboard with live
+                feed, attack map, attempts log, decoy activity, add users
+  /portal     - DECOY: a fake internal "Ops Console" full of fake data.
+                Anyone who logs in with a trap username (HONEY_USERS) lands
+                here with ANY password. Everything they do is recorded.
+
+NOTE: IP location is approximate - usually the city of the attacker's
+internet provider or VPN server, not a street address.
+
+Run:   python app.py
+Open:  http://127.0.0.1:5000
+"""
 import hashlib
-import ipaddress
 import json
 import os
 import random
 import secrets
-import socket
 import sqlite3
-import sys
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from functools import wraps
@@ -16,7 +32,6 @@ from functools import wraps
 from flask import (Flask, abort, g, jsonify, redirect, render_template_string,
                    request, session, url_for)
 from markupsafe import Markup
-from werkzeug.serving import ThreadedWSGIServer
 from werkzeug.security import check_password_hash, generate_password_hash
 
 # On Vercel the project folder is read-only; /tmp is the only writable place
@@ -25,7 +40,7 @@ ON_VERCEL = bool(os.environ.get("VERCEL"))
 DB_PATH = os.environ.get("AUTH_DB") or (
     "/tmp/auth.db" if ON_VERCEL else
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "auth.db"))
-MAX_FAILS = 3          # failed attempts allowed...
+MAX_FAILS = 5          # failed attempts allowed...
 WINDOW_MINUTES = 15    # ...within this many minutes
 LOCK_MINUTES = 15      # how long an IP stays blocked
 TRUST_PROXY = ON_VERCEL  # Vercel is a reverse proxy; real visitor IP is in X-Forwarded-For
@@ -33,15 +48,29 @@ TRUST_PROXY = ON_VERCEL  # Vercel is a reverse proxy; real visitor IP is in X-Fo
 COMPANY = "BlueGold Security Lab"          # made-up company name shown on the pages
 PRODUCT = "BlueGold SecureAccess"   # name of the "sign-in system"
 
-app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
-app.config.update(MAX_CONTENT_LENGTH=64 * 1024, SESSION_COOKIE_SAMESITE="Lax",
-                  SESSION_COOKIE_SECURE=ON_VERCEL)
+# Trap usernames. No real account may use these names. Logging in with one of
+# them (any password) "succeeds" into the decoy portal.
+HONEY_USERS = {"root", "administrator", "test", "guest", "user", "sysadmin",
+               "superuser", "webmaster", "support", "demo", "manager"}
+# If True, an IP that is already blocked for brute force is also sent to the
+# decoy on its next attempt instead of seeing the "too many attempts" message.
+# Off by default: a real user who forgot their password could end up there too.
+DECOY_WHEN_BLOCKED = False
 
-@app.after_request
-def prevent_caching(response):
-    response.headers["Cache-Control"] = "no-store"
-    return response
+# Password for the "admin" account (it is also saved in ADMIN_LOGIN.txt).
+# An ADMIN_PASSWORD environment variable overrides it. To change the password,
+# edit it here and upload again.
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD")
+if not ADMIN_PASSWORD:
+    raise RuntimeError("Set the ADMIN_PASSWORD environment variable before starting the app.")
+
+app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY") or (
+    # Vercel runs several copies of the app; a random key per copy would log
+    # people out at random. Fall back to a key derived from ADMIN_PASSWORD.
+    hashlib.sha256(("session-key:" + ADMIN_PASSWORD).encode()).hexdigest()
+    if ON_VERCEL else secrets.token_hex(32))
+
 
 # ---------------------------------------------------------------- database
 def db():
@@ -89,22 +118,26 @@ def init_db():
     """)
     # Upgrade older databases: add map coordinates and ISP columns.
     cols = {r[1] for r in conn.execute("PRAGMA table_info(login_attempts)")}
-    for col, typ in (("lat", "REAL"), ("lon", "REAL"), ("isp", "TEXT"), ("device", "TEXT")):
+    for col, typ in (("lat", "REAL"), ("lon", "REAL"), ("isp", "TEXT")):
         if col not in cols:
             conn.execute(f"ALTER TABLE login_attempts ADD COLUMN {col} {typ}")
-    admin_password = os.environ.get("ADMIN_PASSWORD")
-    row = conn.execute("SELECT password_hash, is_admin FROM users WHERE username='admin'").fetchone()
-    if admin_password:
-        if len(admin_password) < 12:
-            raise RuntimeError("ADMIN_PASSWORD must contain at least 12 characters.")
-        if not row or not row[1] or not check_password_hash(row[0], admin_password):
-            conn.execute("""
-                INSERT INTO users (username, password_hash, is_admin) VALUES ('admin', ?, 1)
-                ON CONFLICT(username) DO UPDATE SET password_hash=excluded.password_hash, is_admin=1
-            """, (generate_password_hash(admin_password),))
-    elif not row:
-        raise RuntimeError("Run START_HERE.bat or set ADMIN_PASSWORD to initialize admin.")
-
+    # Create a default admin on first run so you can log in and see the logs.
+    if not conn.execute("SELECT 1 FROM users").fetchone():
+        conn.execute("INSERT INTO users (username, password_hash, is_admin) VALUES (?,?,1)",
+                     ("admin", generate_password_hash(ADMIN_PASSWORD)))
+        print("\n*** Created admin account -> username: admin (password: see ADMIN_LOGIN.txt)\n")
+    else:
+        # Keep the admin password in step with ADMIN_PASSWORD, so changing it
+        # here (or in the environment variable) changes the password.
+        row = conn.execute("SELECT password_hash FROM users WHERE username='admin'").fetchone()
+        if row and not check_password_hash(row[0], ADMIN_PASSWORD):
+            conn.execute("UPDATE users SET password_hash=? WHERE username='admin'",
+                         (generate_password_hash(ADMIN_PASSWORD),))
+    clash = [r[0] for r in conn.execute("SELECT username FROM users")
+             if r[0].lower() in HONEY_USERS]
+    if clash:
+        print(f"*** WARNING: real accounts use trap names {clash}; they can't log in "
+              "normally. Rename them or remove the names from HONEY_USERS.")
     conn.commit()
     conn.close()
 
@@ -115,13 +148,10 @@ def now_iso():
 
 # ---------------------------------------------------------------- helpers
 def client_ip():
-    value = request.remote_addr
-    if TRUST_PROXY and request.headers.get("X-Vercel-Forwarded-For"):
-        value = request.headers["X-Vercel-Forwarded-For"].split(",")[0].strip()
-    try:
-        return str(ipaddress.ip_address(value))
-    except ValueError:
-        return "unknown"
+    if TRUST_PROXY and request.headers.get("X-Forwarded-For"):
+        return request.headers["X-Forwarded-For"].split(",")[0].strip()
+    return request.remote_addr or "unknown"
+
 
 _geo_cache = {}
 
@@ -129,25 +159,24 @@ _geo_cache = {}
 def lookup_location(ip):
     """Approximate location from an IP: (country, region, city, isp, lat, lon).
     City-level at best - usually the internet provider's or VPN's location."""
-    if len(_geo_cache) >= 2048:
-        _geo_cache.clear()
     if ip in _geo_cache:
         return _geo_cache[ip]
     private = is_private_ip(ip)
-    if private or os.environ.get("IP_GEOLOCATION") != "1":
-        return ("Local network" if private else "Lookup disabled", "", "", "", None, None)
-
-
+    # A local-network address (127.x, 192.168.x, ...) has no location of its own.
+    # Asking ip-api.com with no IP returns the location of THIS computer's
+    # internet connection, which is where a local visitor really is.
     try:
         with urllib.request.urlopen(
-                f"https://ipwho.is/{ip}"
-                "?fields=success,country,region,city,connection,latitude,longitude",
+                f"http://ip-api.com/json/{'' if private else ip}"
+                "?fields=status,country,regionName,city,isp,lat,lon",
                 timeout=3) as r:
             data = json.load(r)
-        if data.get("success") is True:
-            isp = data.get("connection", {}).get("isp", "")
-            result = (data.get("country", ""), data.get("region", ""),
-                      data.get("city", ""), isp, data.get("latitude"), data.get("longitude"))
+        if data.get("status") == "success":
+            isp = data.get("isp", "")
+            if private:
+                isp = f"{isp} (local network)" if isp else "Local network"
+            result = (data.get("country", ""), data.get("regionName", ""),
+                      data.get("city", ""), isp, data.get("lat"), data.get("lon"))
         else:
             result = ("Local network" if private else "Unknown", "", "", "", None, None)
     except Exception:
@@ -158,24 +187,28 @@ def lookup_location(ip):
 
 
 def is_private_ip(ip):
-    try:
-        address = ipaddress.ip_address(ip)
-    except ValueError:
-        return True
-    return not address.is_global or address.is_multicast
+    return (ip.startswith(("127.", "10.", "192.168.", "::1", "fe80", "::ffff:127."))
+            or (ip.startswith("172.") and ip.count(".") == 3
+                and ip.split(".")[1].isdigit() and 16 <= int(ip.split(".")[1]) <= 31))
 
 
-def reported_device():
-    agent = request.user_agent.string[:512].lower()
-    platforms = (("android", "Android"), ("iphone", "iPhone"), ("ipad", "iPad"),
-                 ("windows", "Windows"), ("macintosh", "macOS"),
-                 ("cros", "ChromeOS"), ("linux", "Linux"))
-    browsers = (("edg", "Edge"), ("opr/", "Opera"), ("samsungbrowser/", "Samsung Internet"),
-                ("firefox/", "Firefox"), ("fxios/", "Firefox"), ("chrome/", "Chrome"),
-                ("crios/", "Chrome"), ("safari/", "Safari"))
-    platform = next((name for token, name in platforms if token in agent), None)
-    browser = next((name for token, name in browsers if token in agent), None)
-    return " · ".join(filter(None, (platform, browser))) or None
+def fill_missing_locations():
+    """Give older attempts that have no map position (e.g. 'Local network')
+    a location now. Runs once at start-up."""
+    conn = sqlite3.connect(DB_PATH)
+    ips = [r[0] for r in conn.execute(
+        "SELECT DISTINCT ip FROM login_attempts WHERE lat IS NULL AND ip IS NOT NULL LIMIT 40")]
+    fixed = 0
+    for ip in ips:
+        country, region, city, isp, lat, lon = lookup_location(ip)
+        if lat is not None:
+            conn.execute("UPDATE login_attempts SET country=?, region=?, city=?, isp=?, lat=?, lon=?"
+                         " WHERE ip=? AND lat IS NULL", (country, region, city, isp, lat, lon, ip))
+            fixed += 1
+    conn.commit()
+    conn.close()
+    if fixed:
+        print(f"*** Added map locations for {fixed} IP address(es) from older attempts.")
 
 
 def log_attempt(username, result):
@@ -183,9 +216,9 @@ def log_attempt(username, result):
     country, region, city, isp, lat, lon = lookup_location(ip)
     db().execute(
         "INSERT INTO login_attempts (username, ip, country, region, city, isp, lat, lon,"
-        " device, result, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        " user_agent, result, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         (username, ip, country, region, city, isp, lat, lon,
-         reported_device(), result, now_iso()))
+         request.headers.get("User-Agent", "")[:300], result, now_iso()))
     db().commit()
 
 
@@ -194,26 +227,24 @@ def log_decoy(action, detail=""):
         "INSERT INTO decoy_events (ip, username, action, detail, user_agent, created_at)"
         " VALUES (?,?,?,?,?,?)",
         (client_ip(), session.get("decoy_user", ""), action, str(detail)[:500],
-         None, now_iso()))
+         request.headers.get("User-Agent", "")[:300], now_iso()))
     db().commit()
 
 
 def blocked_until(ip):
     """Return the time the IP is unblocked, or None if it isn't blocked."""
     since = (datetime.now(timezone.utc) - timedelta(minutes=WINDOW_MINUTES)).isoformat()
-    last_ok = db().execute(
-        "SELECT MAX(created_at) FROM login_attempts WHERE ip=? AND result='success'",
-        (ip,)).fetchone()[0]
-    if last_ok:
-        since = max(since, last_ok)
     rows = db().execute(
         "SELECT created_at FROM login_attempts WHERE ip=? AND created_at>=? "
-        "AND result IN ('wrong_password','unknown_user') ORDER BY created_at DESC LIMIT ?",
-        (ip, since, MAX_FAILS)).fetchall()
+        "AND result IN ('wrong_password','unknown_user') ORDER BY created_at DESC",
+        (ip, since)).fetchall()
     if len(rows) < MAX_FAILS:
         return None
-
-
+    # A success after the failures resets the counter.
+    last_ok = db().execute(
+        "SELECT MAX(created_at) FROM login_attempts WHERE ip=? AND result='success'", (ip,)).fetchone()[0]
+    if last_ok and last_ok > rows[MAX_FAILS - 1]["created_at"]:
+        return None
     until = datetime.fromisoformat(rows[0]["created_at"]) + timedelta(minutes=LOCK_MINUTES)
     return until if until > datetime.now(timezone.utc) else None
 
@@ -226,18 +257,8 @@ def login_required(admin=False):
                 return redirect(url_for("portal"))
             if "user_id" not in session:
                 return redirect(url_for("login"))
-            account = db().execute("SELECT username, is_admin FROM users WHERE id=?",
-                                   (session["user_id"],)).fetchone()
-            if not account or account["username"] != session.get("username"):
-                session.clear()
-                return redirect(url_for("login"))
-            if admin and not account["is_admin"]:
-                abort(404)
-            if admin and request.method == "POST":
-                token = session.get("csrf")
-                submitted = request.form.get("csrf", "").encode()
-                if not token or not secrets.compare_digest(token.encode(), submitted):
-                    abort(400)
+            if admin and not session.get("is_admin"):
+                abort(404)                          # don't reveal that admin pages exist
             return fn(*a, **kw)
         return wrapper
     return deco
@@ -367,17 +388,11 @@ def home():
     return redirect(url_for("login"))
 
 
-@app.post("/simulation")
-@login_required(admin=True)
-def simulation():
-    return enter_decoy("demo")
-
-
 def enter_decoy(username):
     log_attempt(username, "decoy")
     session.clear()
     session["decoy"], session["decoy_user"] = True, username
-    log_decoy("Started simulation")
+    log_decoy("Logged in to decoy", f"username={username}")
     return redirect(url_for("portal"))
 
 
@@ -415,36 +430,38 @@ LOGIN_CSS = """<style>
  @media(max-width:900px){.split{grid-template-columns:1fr}.brand{display:none}.mlogo{display:flex}}
 </style>"""
 
-BLUE_BACKGROUND = "linear-gradient(135deg,#062b59,#0b477f 65%,#082d59)"
-LIGHT_BACKGROUND = "linear-gradient(155deg,#e5effd,#f3f6fb 60%,#edf3fc)"
-
 BANK_LOGIN_THEME = """<style>
-  body.corp{background:LIGHT_BACKGROUND_TOKEN;color:#14243a}
-  .brand{background:BLUE_BACKGROUND_TOKEN;border-radius:22px;min-height:540px}
+  body.corp{background:#f3f6fb;color:#14243a}
+  .brand{background:radial-gradient(900px 520px at -10% -10%,#1d5b9e 0%,transparent 62%),radial-gradient(720px 500px at 110% 110%,#b88a25 0%,transparent 48%),linear-gradient(135deg,#062b59,#0b477f 60%,#082d59)}
   .brand h1{max-width:520px}.brand p{color:#dce8f6}.feat svg{color:#f0cf70}
   .corp .btn{background:#0b3b78}.corp .btn:hover{background:#082e5d}
   .corp .btn.ghost{color:#0b3b78;border-color:#d6dfeb}
   .corp input:focus,.corp select:focus{border-color:#b58a2b;box-shadow:0 0 0 4px #d8b24a2b}
   .link{color:#0b4b88}.row input{accent-color:#0b3b78}
-  .split{min-height:100vh;max-width:1380px;margin:auto;padding:clamp(16px,4vw,56px);gap:clamp(16px,4vw,56px)}
-  .formside{min-width:0;background:#fff;border:1px solid #d6dfeb;border-radius:22px;box-shadow:0 16px 48px #0b3b7812}
-  @media(max-width:900px){.split{max-width:600px}.formside{padding:28px 20px}}
+  .formside{background:linear-gradient(180deg,#fff,#f7f9fc)}
   .box{max-width:420px}.box h2{color:#102d50}.mlogo{color:#0b3b78}
   .secure{color:#6b7890}.foot a:hover{color:#0b3b78}
-</style>""".replace("BLUE_BACKGROUND_TOKEN", BLUE_BACKGROUND).replace("LIGHT_BACKGROUND_TOKEN", LIGHT_BACKGROUND)
+  .login-wordmark{display:flex;align-items:center;gap:14px;font-size:clamp(21px,2vw,25px);font-weight:700;line-height:1.2}
+  .login-wordmark svg,.split .mlogo svg{width:42px;height:42px;flex:none}
+  .split .mlogo{font-size:21px;line-height:1.2}
+  .brand.login-brand{padding:clamp(30px,5vw,76px);background:radial-gradient(ellipse at 80% 65%,#15548c,transparent 66%),linear-gradient(145deg,#08294e,#0b3d70);gap:32px}
+  .brand.login-brand::after{display:none}
+  .login-brand-title{padding:0 0 0 22px;border-left:3px solid #f0cf70}
+  .brand .login-brand-title h1{font-size:clamp(36px,4vw,62px);letter-spacing:-.045em;line-height:1.06;margin:0 0 16px}
+  .login-brand-title h1 span{display:block;color:#f4d77e}
+  .brand .login-brand-title p{color:#e0ecf8;font-size:clamp(15px,1.4vw,18px)}
+  .login-brand-footer{font-size:13px;color:#c2d6ed}
+</style>"""
 
 LOGIN_HTML = """
 <div class="split">
- <section class="brand">
-  <div style="display:flex;align-items:center;gap:12px;font-weight:700;font-size:18px">{{LOGO}} {{COMPANY}}</div>
-  <div>
-   <h1>Explore secure access in a controlled training environment.</h1><div style="display:inline-flex;margin:0 0 14px;padding:6px 10px;border:1px solid #E2B84B55;border-radius:999px;color:#F5D77C;font-size:11px;font-weight:700;letter-spacing:.08em">TRAINING SIMULATOR · NOT A REAL BANK</div>
-   <p>This fictional lab demonstrates login protection, suspicious sign-in monitoring, and account security.</p>
-   <div class="feat">
-    <div>{{icon('shield')}} Single sign-on</div><div>{{icon('lock')}} Encrypted session</div><div>{{icon('server')}} 24/7 IT support</div>
-   </div>
+ <section class="brand login-brand">
+  <div class="login-wordmark">{{LOGO}} <span>{{COMPANY}}</span></div>
+  <div class="login-brand-title">
+   <h1>Access with <span>confidence.</span></h1>
+   <p>Sign in to manage accounts and review sign-in activity.</p>
   </div>
-  <div class="muted" style="color:#94a3b8">&copy; 2026 {{COMPANY}} &middot; Authorized training use only · Not affiliated with BDO</div>
+  <div class="login-brand-footer">Authorized training use only · Not affiliated with BDO</div>
  </section>
  <section class="formside">
   <div class="box">
@@ -453,9 +470,9 @@ LOGIN_HTML = """
    <p class="muted" style="margin:0 0 26px">Administrator access for the security training simulator.</p>
    {% if error %}<div class="alert err">{{icon('alert')}}<div>{{error}}</div></div>{% endif %}
    {% if notice %}<div class="alert ok">{{icon('shield')}}<div>{{notice}}</div></div>{% endif %}
-   <form method="post" id="f" autocomplete="off">
+   <form method="post" id="f" autocomplete="on">
     <div class="field"><label for="u">Username or work email</label>
-     <input id="u" name="username" required autofocus autocomplete="off" placeholder="name@bluegold-lab.local"></div>
+     <input id="u" name="username" required autofocus autocomplete="username" placeholder="name@bluegold-lab.local" value="{{last_user}}"></div>
     <div class="field"><label for="p">Password</label>
      <div class="pw"><input id="p" name="password" type="password" required autocomplete="current-password" placeholder="Enter your password">
       <button type="button" onclick="const p=document.getElementById('p');p.type=p.type==='password'?'text':'password'" aria-label="Show password">{{icon('eye')}}</button></div></div>
@@ -473,9 +490,9 @@ LOGIN_HTML = """
 <script>document.getElementById('f').addEventListener('submit',()=>{const b=document.getElementById('go');b.classList.add('loading');b.querySelector('.lbl').textContent='Signing in…'});</script>"""
 
 
-def login_page(error=None, notice=None):
+def login_page(error=None, notice=None, last_user=""):
     return page(f"Sign in – {COMPANY}", LOGIN_HTML, css=CORP_CSS + LOGIN_CSS + BANK_LOGIN_THEME, body_class="corp",
-                error=error, notice=notice)
+                error=error, notice=notice, last_user=last_user)
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -486,18 +503,22 @@ def login():
         username = request.form.get("username", "").strip()[:100]
         password = request.form.get("password", "")
         until = blocked_until(client_ip())
+        if username.lower() in HONEY_USERS:
+            return enter_decoy(username)
         if until:
-            log_attempt(None, "blocked")
+            if DECOY_WHEN_BLOCKED:
+                return enter_decoy(username)
+            log_attempt(username, "blocked")
             mins = max(1, int((until - datetime.now(timezone.utc)).total_seconds() // 60) + 1)
             error = (f"Your account has been temporarily locked because of too many sign-in attempts. "
                      f"Try again in about {mins} minute(s).")
         else:
             user = db().execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
             if user is None:
-                log_attempt(None, "unknown_user")
+                log_attempt(username, "unknown_user")
                 error = "Your username or password is incorrect. Please try again."
             elif not check_password_hash(user["password_hash"], password):
-                log_attempt(user["username"], "wrong_password")
+                log_attempt(username, "wrong_password")
                 error = "Your username or password is incorrect. Please try again."
             else:
                 log_attempt(username, "success")
@@ -505,12 +526,31 @@ def login():
                 session["user_id"], session["username"], session["is_admin"] = \
                     user["id"], user["username"], bool(user["is_admin"])
                 return redirect(url_for("admin" if user["is_admin"] else "dashboard"))
-    return login_page(error=error)
+    return login_page(error=error, last_user=username)
 
 
-@app.route("/forgot")
+@app.route("/forgot", methods=["GET", "POST"])
 def forgot():
-    return login_page(notice="To reset the lab admin password, stop the server and run START_HERE.bat from the project folder.")
+    """Looks like a real reset page. Nothing is sent - the request is just logged."""
+    sent = False
+    if request.method == "POST":
+        log_decoy("Password reset requested", "email value not recorded")
+        sent = True
+    return page(f"Reset password – {COMPANY}", """
+      <div class="formside" style="min-height:100vh;background:#f5f7fb"><div class="box card" style="padding:32px">
+       <div style="display:flex;align-items:center;gap:10px;font-weight:700;margin-bottom:24px">{{LOGO}} {{COMPANY}}</div>
+       {% if sent %}
+        <h2>Check your email</h2>
+        <p class="muted" style="line-height:1.6">If an account exists for that address, we've sent a link to reset your password. The link expires in 30 minutes.</p>
+       {% else %}
+        <h2>Reset your password</h2>
+        <p class="muted" style="margin:0 0 22px">Enter your work email and we'll send you a reset link.</p>
+        <form method="post"><div class="field"><label>Work email</label><input name="email" type="email" required placeholder="name@bluegold-lab.local"></div>
+        <button class="btn full">Send reset link</button></form>
+       {% endif %}
+       <p style="margin-top:22px;font-size:14px"><a class="link" href="{{url_for('login')}}">&larr; Back to sign in</a></p>
+      </div></div>""", css=CORP_CSS + LOGIN_CSS + BANK_LOGIN_THEME, body_class="corp", sent=sent)
+
 
 @app.route("/sso")
 def sso():
@@ -559,10 +599,11 @@ def dashboard():
        <div class="card"><h2 style="margin:0 0 4px;font-size:16px">Recent sign-in activity</h2>
         <p class="muted" style="margin:0 0 14px">Don't recognise a sign-in? Change your password and contact the IT Service Desk.</p>
         <div class="wrap"><table>
-        <tr><th>Date &amp; time (UTC)</th><th>IP address</th><th>Location</th></tr>
+        <tr><th>Date &amp; time (UTC)</th><th>IP address</th><th>Location</th><th>Device / browser</th></tr>
         {% for r in rows %}<tr><td>{{r.created_at.replace('T',' ')[:16]}}</td><td>{{r.ip}}</td>
-          <td>{{[r.city, r.country]|select|join(', ')}}</td></tr>
-        {% else %}<tr><td colspan="3">No sign-ins yet.</td></tr>{% endfor %}
+          <td>{{[r.city, r.country]|select|join(', ')}}</td>
+          <td title="{{r.user_agent}}">{{r.user_agent[:44]}}</td></tr>
+        {% else %}<tr><td colspan="4">No sign-ins yet.</td></tr>{% endfor %}
         </table></div></div>
       </main>""", css=CORP_CSS, body_class="corp", u=session["username"], rows=rows)
 
@@ -570,7 +611,7 @@ def dashboard():
 # ---------------------------------------------------------------- admin dashboard (dark SOC style)
 LABELS = {"success": ("Success", "ok"), "wrong_password": ("Wrong password", "bad"),
           "unknown_user": ("Unknown user", "bad"), "blocked": ("Blocked", "warn"),
-          "decoy": ("Simulation", "trap")}
+          "decoy": ("Trapped", "trap")}
 
 LEAFLET = """<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>"""
@@ -640,132 +681,58 @@ ADMIN_CSS = """<style>
  .soc .ev[data-ip]:hover{border-color:#334155}
 </style>"""
 
-WORKSPACE_CSS = """<style>
- .soc{display:grid;grid-template-columns:220px minmax(0,1fr);min-height:100vh;background:#101724;font-family:Inter,system-ui,sans-serif}
- .soc main{width:100%;max-width:1600px;min-width:0;align-content:start;padding:32px clamp(16px,3vw,44px) 48px;gap:20px}
- .security-nav{position:sticky;top:0;height:100vh;background:#0a1120;border-right:1px solid #24334b;padding:24px 15px;display:flex;flex-direction:column;gap:36px;color:#e4ebf7}
- .security-brand{display:flex;gap:12px;align-items:center;color:#e4ebf7;padding:0 8px}
- .security-brand span{font-size:15px;font-weight:700}
- .security-brand strong{display:block;color:#a4b6cf;font-weight:500;font-size:12px}
- .security-nav nav{display:grid;gap:5px}
- .security-nav nav a,.security-account a{display:flex;align-items:center;gap:9px;padding:10px;color:#bdcbe0;border-radius:8px;font-size:14px}
- .security-nav nav a:hover,.security-account a:hover{background:#19263b}
- .security-nav nav [aria-current]{background:#1c3150;color:#fff;box-shadow:inset 3px 0 #f5ca72}
- .security-account{margin-top:auto;border-top:1px solid #24334b;padding-top:14px}
- .security-account span{display:block;padding:0 10px;color:#a4b6cf;font-size:13px}
- .workspace-heading{display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:wrap}
- .workspace-heading h1,.audit h1{font-size:clamp(26px,4vw,38px);line-height:1.1;margin:0 0 8px;letter-spacing:-.035em}
- .soc .grid2,.soc .grid2b{grid-template-columns:minmax(0,1.7fr) minmax(0,1fr)}
- .soc .kpis{grid-template-columns:repeat(auto-fit,minmax(min(100%,150px),1fr))}
- .soc .panel{min-width:0;background:#141f32;border-color:#27364f}
- .soc .wrap{overflow:auto}
- .soc #map{height:360px}
- .soc .ph{flex-wrap:wrap}
- .soc a:focus-visible,.soc input:focus-visible,.soc select:focus-visible,.soc button:focus-visible,.soc summary:focus-visible,.soc .wrap:focus-visible{outline:3px solid #dc9c22;outline-offset:3px}
- .audit{background:#f3f5f9;color:#14223a}
- .audit .audit-title{border-bottom:1px solid #cbd5e1;padding-bottom:18px}
- .audit .muted{color:#52627a}
- .audit .audit-tools{display:flex;flex-wrap:wrap;gap:12px;align-items:end;padding:16px;background:#fff;border:1px solid #dce3ed;border-radius:12px}
- .audit .audit-search{flex:1 1 220px}
- .audit label{display:block;font-size:13px;font-weight:650}
- .audit input,.audit select{display:block;margin:6px 0 0;width:100%;min-height:42px;border:1px solid #aebbcf;border-radius:7px;background:#fff;color:#14223a;padding:9px 11px;font:inherit}
- .audit .btn{background:#183557}
- .audit .audit-link{color:#214f82;font-weight:650;padding:10px 4px}
- .audit .ledger{background:#fff;border:1px solid #dce3ed;border-radius:12px;min-width:0}
- .audit .ledger-head,.audit .ledger-foot{display:flex;gap:12px;justify-content:space-between;align-items:center;flex-wrap:wrap;padding:14px 16px}
- .audit .ledger-head h2{margin:0;font-size:17px}
- .audit th,.audit td{white-space:normal;overflow-wrap:anywhere}
- .audit table{width:100%;border-collapse:collapse;text-align:left}
- .audit th,.audit td{padding:13px 16px;border-bottom:1px solid #e4eaf2;color:#14223a}
- .audit th{background:#e9eef6;color:#40526a}
- .audit tr:hover td{background:#f7f9fc}
- .audit td code{color:#214466}
- .audit td small{display:block;color:#52627a;margin-top:4px}
- .audit details{max-width:260px;white-space:normal}
- .audit details summary{color:#214f82;cursor:pointer}
- .audit details p{margin:6px 0;overflow-wrap:anywhere}
- .audit .tag.ok{background:#e1f4e9;color:#14613d}
- .audit .tag.bad{background:#fbe8e8;color:#8b2730}
- .audit .tag.warn{background:#fff1d2;color:#74500d}
- .audit .tag.trap{background:#ede6ff;color:#55358b}
- .audit .empty{padding:36px 16px;text-align:center;white-space:normal}
- @media(max-width:1050px){.soc .grid2,.soc .grid2b{grid-template-columns:minmax(0,1fr)}}
- @media(max-width:720px){
-  .soc{display:block}.security-nav{height:auto;position:static;gap:12px;padding:14px}.security-nav nav{display:flex;flex-wrap:wrap}
-  .security-account{display:flex;align-items:center;margin:0;padding:0;border:0}
-  .soc main{padding-top:24px}
- }
- @media(prefers-reduced-motion:reduce){.soc .pulse,.soc .live i,.soc .ev.new{animation:none}}
+ADMIN_BANK_THEME = """<style>
+  body.soc{background:radial-gradient(900px 520px at -10% -10%,#1d5b9e 0%,transparent 62%),radial-gradient(720px 500px at 110% 110%,#b88a25 0%,transparent 48%),linear-gradient(135deg,#062b59,#0b477f 60%,#082d59);color:#172b45}
+  .soc main > div:first-child:not(.panel):not(.grid2b) h1{color:#fff}
+  .soc main > div:first-child:not(.panel):not(.grid2b) > div > .muted{color:#e0eafa}
+  .soc .bar{background:#0b3b78f5;border-bottom:3px solid #d7ad42;box-shadow:0 4px 18px #092b5018}
+  .soc .bar-in{max-width:1500px}
+  .soc .admin-wordmark{color:#fff;font-size:17px;letter-spacing:-.01em}
+  .soc .admin-wordmark span:first-child{color:#a9d4ff}
+  .soc .admin-wordmark span:nth-child(2){color:#ffdb79}
+  .soc .bar .nav a{color:#dce8f6}.soc .bar .nav a:hover{background:#ffffff18;color:#fff}
+  .soc .bar .nav a.on{background:#ffffff20;color:#f4d77e}.soc .bar .nav a.out{color:#ffe0d8}
+  .soc main{max-width:1500px;padding-top:28px}
+  .soc .panel,.soc .kpi{background:#fff;border:1px solid #dfe6ef;border-radius:15px;box-shadow:0 5px 18px #193b6010}
+  .soc .kpi{padding:18px}.soc .kpi .n{color:#102d50}.soc .kpi .l{color:#64748b}
+  .soc .ph h2{color:#16395f}.soc th{color:#66778d;border-bottom:1px solid #e4eaf2}
+  .soc td{color:#34465e;border-bottom:1px solid #edf1f6}.soc tr:hover td{background:#f7f9fc}
+  .soc .feed .ev{background:#f8fafd;border:1px solid #e5ebf3;color:#34465e}
+  .soc .live{background:#e8f5ed;color:#17653a}.soc .live i{background:#1a9b55}
+  .soc .legend{color:#65758b}
+  .soc .legend button,.soc .plist button{background:#f8fafd;border-color:#dfe6ef;color:#4b5f78}
+  .soc .legend button.on{background:#eaf1fa;border-color:#0b4b88;color:#0b3b78}
+  .soc input{background:#fff;color:#172b45;border-color:#d5deea}
+  .soc .btn{background:#0b3b78}.soc .btn:hover{background:#082e5d}
+  .soc #map{border:1px solid #dfe6ef}
+  .soc .leaflet-popup-content-wrapper,.soc .leaflet-popup-tip{background:#fff;color:#172b45;border:1px solid #d7e0eb}
+  .soc .leaflet-popup-content a{color:#0b4b88}
+  .soc .leaflet-tooltip.plabel{background:#fff;color:#172b45;border-color:#d7e0eb}
+  .soc .leaflet-bar a{background:#fff;color:#17395e;border-color:#d7e0eb}
+  .soc .leaflet-control-attribution{background:#ffffffdd!important;color:#68798e}
+  .soc .leaflet-control-attribution a{color:#0b4b88}
+  @media(max-width:720px){.soc .bar-in{padding:12px}.soc .nav{width:100%}.soc .nav a{font-size:12px;padding:7px 8px}}
+  .soc main{padding:26px clamp(16px,3vw,44px) 48px;gap:22px}
+  .soc .overview-intro{background:#082d598c;border:1px solid #ffffff32;border-radius:16px;padding:20px 22px;box-shadow:inset 3px 0 #d7ad42}
+  .soc .panel,.soc .kpi{border-radius:16px;box-shadow:0 8px 24px #041e3d29}
+  .soc .grid2 > *, .soc .grid2b > *{min-width:0}
+  .soc .wrap{overflow-x:auto}
+  .soc .ph{flex-wrap:wrap}
 </style>"""
 
 
-LIGHT_ADMIN_CSS = """<style>
- body.soc,body.soc.audit{background:LIGHT_BACKGROUND_TOKEN;color:#102d50}
- .soc .security-nav{background:#fff;border-color:#d6dfeb;color:#102d50}
- .soc .security-brand{padding:14px 10px;border-radius:10px;background:linear-gradient(135deg,#062b59,#0b477f);color:#fff}
- .soc .security-brand strong{color:#dce8f6}
- .soc .security-account span{color:#345475}
- .soc .security-account{border-color:#d6dfeb}
- .soc .security-nav nav a,.soc .security-account a{color:#345475}
- .soc .security-nav nav a:hover,.soc .security-account a:hover{background:#edf3fb}
- .soc .security-nav nav [aria-current]{background:#e6eef9;color:#0b4b88;box-shadow:inset 3px 0 #b58a2b}
- .soc .workspace-heading{padding:24px;background:BLUE_BACKGROUND_TOKEN;color:#fff;box-shadow:inset 0 -3px #d6ad4f;border:1px solid #d3e0f1;border-radius:16px}
- .soc .workspace-heading .muted{color:#dce8f6}
- .soc .muted,.soc .kpi .l span{color:#4c6079}
- .soc .panel,.soc .kpi{background:#fff;border-color:#d6dfeb}
- .soc th,.soc td{border-color:#e0e8f3;color:#244467}
- .soc th{background:#edf3fb}
- .soc tr:hover td,.soc tr[data-ip]:hover td{background:#edf3fb}
- .soc .tag.ok{background:#e1f4e9;color:#14613d}
- .soc .tag.bad{background:#fbe8e8;color:#8b2730}
- .soc .tag.warn{background:#fff1d2;color:#74500d}
- .soc .tag.trap{background:#ede6ff;color:#55358b}
- .soc .live{background:#fff;color:#14613d;border:1px solid #b9dbcd;padding:7px 12px}
- .soc .btn{background:#0b3b78;color:#fff}
- .soc .btn:hover{background:#082e5d}
- .soc input{background:#fff;color:#102d50;border-color:#aabbd0}
- .soc .msg.ok{background:#e1f4e9;color:#14613d}
- .soc .msg.err{background:#fbe8e8;color:#8b2730}
- .soc .ev{background:#f5f8fc;border-color:#e0e8f3}
- .soc .ev.new{animation:light-flash 2s}
- @keyframes light-flash{from{background:#dbe9fa}to{background:#f5f8fc}}
- .soc .legend button,.soc .plist button{background:#fff;color:#345475;border-color:#cbd8e9}
- .soc .legend button.on{background:#e6eef9;color:#0b4b88;border-color:#b58a2b}
- .soc .legend button:hover,.soc .plist button:hover{background:#edf3fb;color:#102d50}
- .soc .legend button em,.soc .plist button em{color:#4c6079}
- .soc #map{background:#edf3fb;color:#345475}
- .soc .darktiles{filter:none}
- .soc .leaflet-popup-content-wrapper,.soc .leaflet-popup-tip,.soc .leaflet-tooltip.plabel,.soc .leaflet-bar a{background:#fff;color:#102d50;border-color:#b9cade}
- .soc .leaflet-popup-content a,.soc .leaflet-control-attribution a,.audit .audit-link,.audit details summary{color:#0b4b88}
- .soc .leaflet-control-attribution{background:#ffffffeb!important;color:#345475}
- .soc .feed{max-height:238px}
- .soc .monitoring-row{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(0,1fr);gap:18px}
- .soc .audit-tools,.soc .ledger{border-color:#d6dfeb}
- .audit .audit-title{border-color:#ccd9e9}
- @media(max-width:1050px){.soc .monitoring-row{grid-template-columns:minmax(0,1fr)}}
- @media(prefers-reduced-motion:reduce){.soc .ev.new{animation:none}}
-</style>""".replace("BLUE_BACKGROUND_TOKEN", BLUE_BACKGROUND).replace("LIGHT_BACKGROUND_TOKEN", LIGHT_BACKGROUND)
-
-
 def admin_shell(active, content, title, head="", **ctx):
-    if "csrf" not in session:
-        session["csrf"] = secrets.token_urlsafe(32)
     nav = [("admin", "chart", "Overview"), ("logs", "list", "All attempts"),
-           ("decoy_log", "target", "Simulation activity"), ("add_user", "plus", "Add user")]
+           ("decoy_log", "target", "Decoy activity"), ("add_user", "plus", "Add user")]
     shell = """
-      <aside class="security-nav">
-       <a class="security-brand" href="{{url_for('admin')}}">{{LOGO}}<span>BlueGold<strong>SecureAccess</strong></span></a>
-       <nav aria-label="Administration">
-        {% for ep, ic, name in nav %}
-        <a href="{{url_for(ep)}}" {% if ep==active %}aria-current="page"{% endif %}>{{icon(ic,18)}} {{name}}</a>
-        {% endfor %}
-       </nav>
-       <div class="security-account"><span>{{session.username}}</span>
-        <a href="{{url_for('logout')}}">{{icon('logout',16)}} Sign out</a></div>
-      </aside>
-      <main id="main">CONTENT</main>"""
-    return page(title, shell.replace("CONTENT", content), head=head, css=ADMIN_CSS + WORKSPACE_CSS + LIGHT_ADMIN_CSS,
-                body_class="soc audit" if active == "logs" else "soc", nav=nav, active=active, **ctx)
+     <div class="bar"><div class="bar-in">
+      <div style="display:flex;align-items:center;gap:10px;font-weight:700">{{LOGO}}
+       <span class="admin-wordmark"><span>Blue</span><span>Gold</span> SecureAccess</span></div>
+      <nav class="nav">{% for ep, ic, name in nav %}<a href="{{url_for(ep)}}" class="{{'on' if ep==active}}">{{icon(ic,16)}} {{name}}</a>{% endfor %}
+       <a class="out" href="{{url_for('logout')}}">{{icon('logout',16)}} Log out</a></nav>
+     </div></div><main>CONTENT</main>"""
+    return page(title, shell.replace("CONTENT", content), head=head, css=ADMIN_CSS + ADMIN_BANK_THEME,
+                body_class="soc", nav=nav, active=active, **ctx)
 
 
 def admin_data():
@@ -775,17 +742,17 @@ def admin_data():
         {"label": "Attempts · 24h", "n": q("SELECT COUNT(*) FROM login_attempts WHERE created_at>=?", day), "c": "#3b82f6", "i": "chart"},
         {"label": "Failed · 24h", "n": q("SELECT COUNT(*) FROM login_attempts WHERE created_at>=? AND result IN ('wrong_password','unknown_user')", day), "c": "#ef4444", "i": "alert"},
         {"label": "Blocked · 24h", "n": q("SELECT COUNT(*) FROM login_attempts WHERE created_at>=? AND result='blocked'", day), "c": "#f59e0b", "i": "lock"},
-        {"label": "Simulation entries", "n": q("SELECT COUNT(*) FROM login_attempts WHERE result='decoy'"), "c": "#8b5cf6", "i": "target"},
-        {"label": "Simulation actions", "n": q("SELECT COUNT(*) FROM decoy_events"), "c": "#ec4899", "i": "eye"},
-        {"label": "Unique IPs", "n": q("SELECT COUNT(DISTINCT ip) FROM login_attempts"), "c": "#0b4b88", "i": "map"},
+        {"label": "Decoy sign-ins", "n": q("SELECT COUNT(*) FROM login_attempts WHERE result='decoy'"), "c": "#8b5cf6", "i": "target"},
+        {"label": "Decoy actions", "n": q("SELECT COUNT(*) FROM decoy_events"), "c": "#ec4899", "i": "eye"},
+        {"label": "Unique IPs", "n": q("SELECT COUNT(DISTINCT ip) FROM login_attempts"), "c": "#14b8a6", "i": "map"},
     ]
     places = [dict(r) for r in db().execute("""
         SELECT ip, MAX(country) country, MAX(region) region, MAX(city) city, MAX(isp) isp,
                MAX(lat) lat, MAX(lon) lon, COUNT(*) total,
                SUM(result IN ('wrong_password','unknown_user','blocked')) failed,
                SUM(result='decoy') trapped, SUM(result='success') ok,
-               MAX(created_at) last_seen
-        FROM login_attempts WHERE lat IS NOT NULL AND lon IS NOT NULL GROUP BY ip""")]
+               MAX(created_at) last_seen, GROUP_CONCAT(DISTINCT username) usernames
+        FROM login_attempts WHERE lat IS NOT NULL GROUP BY ip""")]
     recent = [dict(r) for r in db().execute(
         "SELECT id, username, ip, country, city, isp, result, created_at FROM login_attempts "
         "ORDER BY id DESC LIMIT 30")]
@@ -794,6 +761,9 @@ def admin_data():
                SUM(result='decoy') trapped, MAX(created_at) last_seen
         FROM login_attempts WHERE result!='success'
         GROUP BY ip ORDER BY n DESC LIMIT 8""")]
+    usernames = [dict(r) for r in db().execute("""
+        SELECT username, COUNT(*) n FROM login_attempts WHERE result!='success'
+        GROUP BY username ORDER BY n DESC LIMIT 8""")]
     hours = [0] * 24
     for r in db().execute("SELECT created_at FROM login_attempts WHERE created_at>=?", (day,)):
         hrs = int((datetime.now(timezone.utc) - datetime.fromisoformat(r[0])).total_seconds() // 3600)
@@ -801,7 +771,7 @@ def admin_data():
             hours[23 - hrs] += 1
     no_coords = q("SELECT COUNT(DISTINCT ip) FROM login_attempts WHERE lat IS NULL")
     return {"stats": stats, "places": places, "recent": recent, "attackers": attackers,
-            "hours": hours, "no_coords": no_coords, "geo_enabled": os.environ.get("IP_GEOLOCATION") == "1", "labels": LABELS}
+            "usernames": usernames, "hours": hours, "no_coords": no_coords, "labels": LABELS}
 
 
 @app.route("/admin/api/feed")
@@ -814,41 +784,41 @@ def admin_feed():
 @login_required(admin=True)
 def admin():
     return admin_shell("admin", """
-      <div class="workspace-heading">
-       <div><h1>Security overview</h1>
-        <div class="muted">Login activity, rate-limit events, and simulation activity</div></div>
-       <span class="live" id="feed-status"><i></i> Refreshes every 10 seconds</span></div>
+      <div class="overview-intro" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
+       <div><h1 style="margin:0;font-size:22px;letter-spacing:-.01em">Security overview</h1>
+        <div class="muted">Sign-in activity and access monitoring</div></div>
+       <span class="live"><i></i> Live · updates every 10s</span></div>
       <div class="kpis" id="kpis"></div>
-      <div class="monitoring-row">
-       <div class="panel"><div class="ph"><h2>{{icon('chart',16)}} Attempts per hour · last 24h</h2></div><div id="hours"></div></div>
-       <div class="panel"><div class="ph"><h2>{{icon('bell',16)}} Live event feed</h2></div><div class="feed" id="feed"></div></div>
-      </div>
+      <div class="grid2">
        <div class="panel"><div class="ph"><h2>{{icon('map',16)}} Login activity map</h2>
          <div class="legend" id="mfilter">
           <button data-f="all" class="on">All <em id="c-all"></em></button>
           <button data-f="ok"><b style="background:#22c55e"></b>Success <em id="c-ok"></em></button>
           <button data-f="bad"><b style="background:#ef4444"></b>Failed / blocked <em id="c-bad"></em></button>
-          <button data-f="trap"><b style="background:#a78bfa"></b>Simulation <em id="c-trap"></em></button></div></div>
+          <button data-f="trap"><b style="background:#a78bfa"></b>Decoy <em id="c-trap"></em></button></div></div>
         <div id="map"></div>
         <div class="plist" id="plist"></div>
         <p class="muted" style="margin:10px 0 0;font-size:12px">Location comes from the IP address: roughly the city of the internet provider or VPN, not a street address.
          <span id="nocoords"></span></p></div>
-       <div class="panel"><div class="ph"><h2>{{icon('alert',16)}} Sources with unsuccessful attempts</h2>
-        <a class="muted" href="{{url_for('logs')}}">All attempts &rarr;</a></div>
-        <div class="wrap"><table id="att"></table></div></div>
+       <div class="panel"><div class="ph"><h2>{{icon('bell',16)}} Live event feed</h2></div><div class="feed" id="feed"></div></div>
+      </div>
+      <div class="grid2b">
+       <div class="panel"><div class="ph"><h2>{{icon('chart',16)}} Attempts per hour · last 24h</h2></div><div id="hours"></div></div>
+       <div class="panel"><div class="ph"><h2>{{icon('users',16)}} Most-tried usernames</h2></div><div id="unames"></div></div>
+      </div>
+      <div class="panel"><div class="ph"><h2>{{icon('alert',16)}} Most active source IPs</h2><a class="muted" href="{{url_for('logs')}}">All attempts &rarr;</a></div>
+       <div class="wrap"><table id="att"></table></div></div>
       <script>
        let data = {{data|tojson}};
        const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
        const where = (...a) => a.filter(Boolean).map(esc).join(', ') || '—';
        const ago = iso => { const s=(Date.now()-new Date(iso))/1000; return s<60?Math.floor(s)+'s ago':s<3600?Math.floor(s/60)+'m ago':s<86400?Math.floor(s/3600)+'h ago':Math.floor(s/86400)+'d ago'; };
-       const attemptsUrl = {{url_for('logs')|tojson}};
        const ICON = {{icons|tojson}};
-       const map = window.L ? L.map('map', {worldCopyJump:true, zoomControl:true}).setView([20,10], 2) : null;
-       if (map) L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+       const map = L.map('map', {worldCopyJump:true, zoomControl:true}).setView([20,10], 2);
+       L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',
          {maxZoom:18, className:'darktiles', attribution:'&copy; OpenStreetMap contributors'}).addTo(map);
-       const layer = map ? L.layerGroup().addTo(map) : null;
-       if (!map) document.getElementById('map').textContent = 'The map library could not load.';
-       let seen = new Set(), first = true, filter = 'all', openIp = null, markers = Object.create(null);
+       const layer = L.layerGroup().addTo(map);
+       let seen = new Set(), first = true, filter = 'all', openIp = null, markers = {};
        const FILTERS = {all: p => true, ok: p => p.ok > 0, bad: p => p.failed > 0, trap: p => p.trapped > 0};
        // One IP can have successes AND failures (e.g. you typed a wrong password once).
        // With a filter on, its dot takes that filter's colour and counts; on "All" it
@@ -861,7 +831,6 @@ def admin():
        const countText = p => kindsOf(p).map(k => `${COUNT[k](p)} ${NAMES[k]}`).join(' · ');
        const placeName = p => [p.city, p.country].filter(Boolean).join(', ') || p.region || p.country || p.ip;
        function fitVisible(){
-         if (!map) return;
          const pts = data.places.filter(FILTERS[filter]).map(p => [p.lat,p.lon]);
          if (pts.length===1) map.flyTo(pts[0],6); else if (pts.length>1) map.flyToBounds(pts,{padding:[40,40],maxZoom:6});
        }
@@ -871,7 +840,6 @@ def admin():
          openIp = null; map.closePopup(); render(); if (fit) fitVisible();
        }
        function goTo(ip, f){
-         if (!map) return;
          const p = data.places.find(x => x.ip===ip); if (!p) return;
          if (f && f!==filter) setFilter(f, false); else if (!markers[ip]) setFilter('all', false);
          const m = markers[ip], ll = L.latLng(p.lat,p.lon), z = Math.max(map.getZoom(), 8);
@@ -885,12 +853,12 @@ def admin():
          document.getElementById(id).addEventListener('click', e => { const el = e.target.closest('[data-ip]'); if (el && !e.target.closest('a')) goTo(el.dataset.ip, el.dataset.f); });
        function render(){
          document.getElementById('kpis').innerHTML = data.stats.map(s =>
-           `<div class="kpi" style="--c:${s.c}"><div class="l" style="color:${s.c}">${ICON[s.i]}<span>${esc(s.label)}</span></div><div class="n">${s.n}</div></div>`).join('');
+           `<div class="kpi" style="--c:${s.c}"><div class="l" style="color:${s.c}">${ICON[s.i]}<span style="color:#94a3b8">${esc(s.label)}</span></div><div class="n">${s.n}</div></div>`).join('');
          const keepOpen = openIp;
-         layer?.clearLayers(); markers = Object.create(null); const pts=[];
+         layer.clearLayers(); markers = {}; const pts=[];
          for (const f in FILTERS) document.getElementById('c-'+f).textContent = data.places.filter(FILTERS[f]).length;
          const visible = data.places.filter(FILTERS[filter]);
-         for (const p of map ? visible : []) {
+         for (const p of visible) {
            const color = placeColor(p);
            const r = Math.min(6 + Math.sqrt(p.total)*2.2, 24);
            if (kindsOf(p).some(k => k!=='ok')) L.circleMarker([p.lat,p.lon],{radius:r,color,fill:false,className:'pulse',interactive:false}).addTo(layer);
@@ -900,9 +868,10 @@ def admin():
             .on('popupclose', () => { if (openIp===p.ip) openIp = null; });
            markers[p.ip] = m;
            m.bindPopup(`<b style="font-size:14px">${esc(p.ip)}</b><br>${where(p.city,p.region,p.country)}<br>
-              <span class="muted">ISP:</span> ${esc(p.isp)}<br>
-              <span class="muted">Attempts:</span> ${p.total} &nbsp;(<span style="color:#a12b38">${p.failed} failed</span>, <span style="color:#14613d">${p.ok} ok</span>, <span style="color:#55358b">${p.trapped} trapped</span>)<br>
-              <span class="muted">Last seen:</span> ${ago(p.last_seen)}<br>
+              <span style="color:#94a3b8">ISP:</span> ${esc(p.isp)}<br>
+              <span style="color:#94a3b8">Attempts:</span> ${p.total} &nbsp;(<span style="color:#fca5a5">${p.failed} failed</span>, <span style="color:#86efac">${p.ok} ok</span>, <span style="color:#c4b5fd">${p.trapped} trapped</span>)<br>
+              <span style="color:#94a3b8">Usernames:</span> ${esc(p.usernames)}<br>
+              <span style="color:#94a3b8">Last seen:</span> ${ago(p.last_seen)}<br>
               <a target="_blank" href="https://www.openstreetmap.org/?mlat=${p.lat}&mlon=${p.lon}#map=11/${p.lat}/${p.lon}">Open area map ↗</a>`)
            m.addTo(layer);
            pts.push([p.lat,p.lon]);
@@ -913,118 +882,89 @@ def admin():
          document.getElementById('plist').innerHTML = visible.length ? [...visible].sort((a,b) => shown(b)-shown(a)).map(p =>
            `<button data-ip="${esc(p.ip)}" title="${esc(p.ip)} – click to go there">${kindsOf(p).map(k => `<b style="background:${COLORS[k]}"></b>`).join('')}${esc(placeName(p))} <em>${countText(p)}</em></button>`).join('')
            : '<span class="muted" style="font-size:12px">No places in this category yet.</span>';
-         const onMap = new Set(map ? data.places.map(p => p.ip) : []);
+         const onMap = new Set(data.places.map(p => p.ip));
          const KIND = {ok:'ok', bad:'bad', warn:'bad', trap:'trap'};   // feed tag -> map filter
          const ipAttr = (ip, cls) => onMap.has(ip) ? ` data-ip="${esc(ip)}"${cls ? ` data-f="${KIND[cls]}"` : ''} title="Show on map"` : '';
-         document.getElementById('nocoords').textContent = !data.geo_enabled ? ' Location lookup is disabled. Set IP_GEOLOCATION=1 to map new public-IP attempts.' :
-           data.no_coords ? ` ${data.no_coords} source IP(s) have no coordinates.` : '' ;
+         document.getElementById('nocoords').textContent = data.no_coords ? `${data.no_coords} IP(s) not on the map (local network or lookup failed).` : '';
          const col = {ok:'#22c55e',bad:'#ef4444',warn:'#f59e0b',trap:'#a78bfa'};
          document.getElementById('feed').innerHTML = data.recent.length ? data.recent.map(r => {
-           const [lbl, cls] = data.labels[r.result] || ['Other', 'warn']; const isNew = !first && !seen.has(r.id);
+           const [lbl, cls] = data.labels[r.result]; const isNew = !first && !seen.has(r.id);
            return `<div class="ev ${isNew?'new':''}"${ipAttr(r.ip, cls)}><span class="dot" style="background:${col[cls]}"></span><div style="min-width:0;flex:1">
-             <div style="display:flex;justify-content:space-between;gap:8px"><b>${esc(r.username)||'Sign-in attempt'}</b><span class="tag ${cls}">${lbl}</span></div>
+             <div style="display:flex;justify-content:space-between;gap:8px"><b>${esc(r.username)||'<i>empty</i>'}</b><span class="tag ${cls}">${lbl}</span></div>
              <div class="muted" style="font-size:12px;margin-top:3px">${esc(r.ip)} · ${where(r.city,r.country)} · ${ago(r.created_at)}</div></div></div>`;
          }).join('') : '<div class="muted">No sign-in attempts yet.</div>';
-         seen = new Set(data.recent.map(r => r.id));
+         data.recent.forEach(r => seen.add(r.id));
          const mx = Math.max(1, ...data.hours);
          document.getElementById('hours').innerHTML = `<div style="display:flex;align-items:flex-end;gap:4px;height:150px">${data.hours.map((v,i)=>
-           `<div title="${v} attempt(s), ${23-i}h ago" style="flex:1;height:${Math.max(3, v/mx*100)}%;background:${v?'linear-gradient(#4081c2,#0b3b78)':'#e0e8f3'};border-radius:4px 4px 0 0"></div>`).join('')}</div>
+           `<div title="${v} attempt(s), ${23-i}h ago" style="flex:1;height:${Math.max(3, v/mx*100)}%;background:${v?'linear-gradient(#3b82f6,#1d4ed8)':'#1e293b'};border-radius:4px 4px 0 0"></div>`).join('')}</div>
            <div class="muted" style="display:flex;justify-content:space-between;font-size:11px;margin-top:6px"><span>24h ago</span><span>12h ago</span><span>now</span></div>`;
-
-
+         const um = Math.max(1, ...data.usernames.map(u=>u.n));
+         document.getElementById('unames').innerHTML = data.usernames.length ? data.usernames.map(u =>
+           `<div style="margin-bottom:10px"><div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:4px"><span>${esc(u.username)||'<i>empty</i>'}</span><span class="muted">${u.n}</span></div>
+            <div style="height:7px;background:#1e293b;border-radius:9px"><div style="height:100%;width:${u.n/um*100}%;background:linear-gradient(90deg,#8b5cf6,#ec4899);border-radius:9px"></div></div></div>`).join('')
+           : '<div class="muted">No failed attempts yet.</div>';
          document.getElementById('att').innerHTML = '<tr><th>IP address</th><th>Location</th><th>ISP</th><th>Attempts</th><th>Status</th><th>Last seen</th></tr>' +
-           (data.attackers.length ? data.attackers.map(a => `<tr${ipAttr(a.ip)}><td style="font-family:ui-monospace,monospace"><a href="${attemptsUrl}?q=${encodeURIComponent(a.ip)}">${esc(a.ip)}</a></td><td>${where(a.city,a.country)}</td>
-             <td>${esc((a.isp||'').slice(0,30))}</td><td><b>${a.n}</b></td><td>${a.trapped?'<span class="tag trap">Simulation</span>':'<span class="tag bad">Unsuccessful</span>'}</td><td class="muted">${ago(a.last_seen)}</td></tr>`).join('')
+           (data.attackers.length ? data.attackers.map(a => `<tr${ipAttr(a.ip)}><td style="font-family:ui-monospace,monospace">${esc(a.ip)}</td><td>${where(a.city,a.country)}</td>
+             <td>${esc((a.isp||'').slice(0,30))}</td><td><b>${a.n}</b></td><td>${a.trapped?'<span class="tag trap">Trapped</span>':'<span class="tag bad">Attacking</span>'}</td><td class="muted">${ago(a.last_seen)}</td></tr>`).join('')
              : '<tr><td colspan="6" class="muted">No failed attempts yet.</td></tr>');
          first = false;
        }
        render();
-       const status = document.getElementById('feed-status');
-       async function refresh(){
-         try {
-           const response = await fetch('{{url_for("admin_feed")}}');
-           if (!response.ok || !response.headers.get('content-type')?.includes('json')) throw new Error();
-           data = await response.json();
-           render();
-           status.textContent = 'Updated ' + new Date().toLocaleTimeString();
-         } catch {
-           status.textContent = 'Live refresh unavailable';
-         } finally {
-           setTimeout(refresh, 10000);
-         }
-       }
-       setTimeout(refresh, 10000);
+       setInterval(async () => { try { const r = await fetch('{{url_for("admin_feed")}}'); if (r.ok && r.headers.get('content-type','').includes('json')) { data = await r.json(); render(); } } catch(e){} }, 10000);
       </script>""", f"Admin Security Center – {PRODUCT}", head=LEAFLET, data=admin_data(),
                        icons={k: str(icon(k, 15)) for k in ("chart", "alert", "lock", "target", "eye", "map")})
+
+
+def browser_name(agent):
+    agent = (agent or "").lower()
+    for tokens, name in (
+        (("edg/", "edga/", "edgios/"), "Edge"),
+        (("opr/", "opios/"), "Opera"),
+        (("samsungbrowser/",), "Samsung Internet"),
+        (("firefox/", "fxios/"), "Firefox"),
+        (("chrome/", "crios/"), "Chrome"),
+        (("safari/",), "Safari"),
+        (("werkzeug/",), "Werkzeug"),
+    ):
+        if any(token in agent for token in tokens):
+            return name
+    return "Unknown browser"
+
+
+def browser_and_device(agent):
+    browser = browser_name(agent)
+    agent = (agent or "").lower()
+    if "iphone" in agent:
+        return f"iPhone · {browser}"
+    if "ipad" in agent:
+        return f"iPad · {browser}"
+    if "android" in agent:
+        device = "Android phone" if "mobile" in agent else "Android device"
+        return f"{device} · {browser}"
+    if "mobile" in agent:
+        return f"Mobile device · {browser}"
+    return browser
 
 
 @app.route("/logs")
 @login_required(admin=True)
 def logs():
-    query = request.args.get("q", "").strip()[:100]
-    outcome = request.args.get("outcome", "")
-    if outcome not in LABELS:
-        outcome = ""
-    page_size = 25
-    conditions = []
-    parameters = []
-    if query:
-        conditions.append("""instr(lower(coalesce(username,'') || ' ' || coalesce(ip,'') ||
-                         ' ' || coalesce(city,'') || ' ' || coalesce(region,'') ||
-                         ' ' || coalesce(country,'') || ' ' || coalesce(isp,'') ||
-                         ' ' || coalesce(device,'')), lower(?)) > 0""")
-        parameters.append(query)
-    if outcome:
-        conditions.append("result=?")
-        parameters.append(outcome)
-    where = " WHERE " + " AND ".join(conditions) if conditions else ""
-    count = db().execute("SELECT COUNT(*) FROM login_attempts" + where, parameters).fetchone()[0]
-    pages = max(1, (count + page_size - 1) // page_size)
-    current = max(1, min(pages, request.args.get("page", 1, type=int)))
-    rows = db().execute(
-        "SELECT id, created_at, username, result, ip, city, region, country, isp, lat, lon, device "
-        "FROM login_attempts" + where + " ORDER BY id DESC LIMIT ? OFFSET ?",
-        [*parameters, page_size, (current - 1) * page_size]).fetchall()
+    rows = db().execute("SELECT * FROM login_attempts ORDER BY id DESC LIMIT 500").fetchall()
     return admin_shell("logs", """
-      <header class="audit-title"><h1>All attempts</h1><div class="muted">Sign-in history · newest first · UTC</div></header>
-      <form class="audit-tools" method="get" role="search">
-       <label class="audit-search" for="attempt-search">Search
-        <input id="attempt-search" name="q" type="search" value="{{query}}" maxlength="100" placeholder="IP, account, location, ISP or device"></label>
-       <label for="attempt-outcome">Outcome
-        <select id="attempt-outcome" name="outcome">
-         <option value="">All outcomes</option>
-         {% for code, label in labels.items() %}<option value="{{code}}" {% if code==outcome %}selected{% endif %}>{{label[0]}}</option>{% endfor %}
-        </select></label>
-       <button class="btn">Apply filters</button>
-       {% if query or outcome %}<a class="audit-link" href="{{url_for('logs')}}">Clear filters</a>{% endif %}
-      </form>
-      <section class="ledger" aria-labelledby="attempt-results">
-       <div class="ledger-head"><h2 id="attempt-results">Attempt history</h2><span class="muted">{{count}} matching {{'event' if count==1 else 'events'}}</span></div>
-       <div class="wrap" tabindex="0" role="region" aria-label="Sign-in attempts table"><table>
-        <thead><tr><th scope="col">Timestamp (UTC)</th><th scope="col">Result</th><th scope="col">Username</th><th scope="col">IP address</th><th scope="col">Country</th><th scope="col">Region</th><th scope="col">City</th><th scope="col">Street</th><th scope="col">ISP</th><th scope="col">MAC address</th><th scope="col">Reported browser / OS</th></tr></thead>
-        <tbody>{% for r in rows %}<tr>
-         <td><time datetime="{{r.created_at}}">{{r.created_at.replace('T',' ')[:19]}}</time></td>
-         {% set label = labels.get(r.result, ('Other', 'warn')) %}
-         <td><span class="tag {{label[1]}}">{{label[0]}}</span></td>
-         <td>{{r.username or 'No matching account' if r.result == 'unknown_user' else 'Account not recorded'}}</td><td><code>{{r.ip or 'IP unavailable'}}</code></td>
-         <td>{{r.country or 'Country unavailable'}}</td>
-         <td>{{r.region or ('Local connection' if r.country == 'Local network' else 'Region unavailable')}}</td>
-         <td>{{r.city or ('Local connection' if r.country == 'Local network' else 'City unavailable')}}</td>
-         <td class="muted">Street not determined</td>
-         <td>{{r.isp or ('Local connection' if r.country == 'Local network' else 'Unavailable')}}</td>
-         <td class="muted" title="Web requests do not include a device MAC address">Not sent by browser</td>
-         <td>{{r.device or 'Not reported'}}</td>
-        </tr>{% else %}<tr><td colspan="11" class="empty">
-        {% if query or outcome %}No attempts match these filters.{% else %}No sign-in attempts have been recorded yet.{% endif %}
-        </td></tr>{% endfor %}</tbody>
-       </table></div>
-       {% if pages > 1 %}<nav class="ledger-foot" aria-label="Attempt history pages">
-        <span>Page {{current}} of {{pages}}</span>
-        <div>{% if current > 1 %}<a class="audit-link" rel="prev" href="{{url_for('logs', q=query, outcome=outcome, page=current-1)}}">Previous</a>{% endif %}
-        {% if current < pages %}<a class="audit-link" rel="next" href="{{url_for('logs', q=query, outcome=outcome, page=current+1)}}">Next</a>{% endif %}</div>
-       </nav>{% endif %}
-      </section>""", f"All attempts – {PRODUCT}", rows=rows, labels=LABELS, query=query,
-                       outcome=outcome, count=count, pages=pages, current=current)
+      <div class="panel"><div class="ph"><h2>{{icon('list',16)}} All sign-in attempts <span class="muted">(latest 500)</span></h2></div>
+      <div class="wrap"><table>
+      <tr><th>Time (UTC)</th><th>Username</th><th>Result</th><th>IP</th>
+          <th>Country</th><th>Region</th><th>City</th><th>ISP</th><th>Map</th><th>Browser / device</th></tr>
+      {% for r in rows %}<tr>
+        <td>{{r.created_at.replace('T',' ')[:19]}}</td><td><b>{{r.username}}</b></td>
+        <td><span class="tag {{labels[r.result][1]}}">{{labels[r.result][0]}}</span></td>
+        <td style="font-family:ui-monospace,monospace">{{r.ip}}</td><td>{{r.country}}</td><td>{{r.region}}</td><td>{{r.city}}</td>
+        <td>{{(r.isp or '')[:28]}}</td>
+        <td>{% if r.lat is not none %}<a style="color:#93c5fd" target="_blank"
+            href="https://www.openstreetmap.org/?mlat={{r.lat}}&mlon={{r.lon}}#map=11/{{r.lat}}/{{r.lon}}">📍 map</a>{% endif %}</td>
+        <td class="muted" title="{{r.user_agent}}">{{browser_and_device(r.user_agent)}}</td></tr>
+      {% else %}<tr><td colspan="10" class="muted">No attempts yet.</td></tr>{% endfor %}
+      </table></div></div>""", f"All attempts – {PRODUCT}", rows=rows, labels=LABELS, browser_and_device=browser_and_device)
 
 
 @app.route("/admin/decoy")
@@ -1033,15 +973,14 @@ def decoy_log():
     rows = db().execute("SELECT * FROM decoy_events ORDER BY id DESC LIMIT 500").fetchall()
     return admin_shell("decoy_log", """
       <div class="panel"><div class="ph"><h2>{{icon('target',16)}} Decoy activity <span class="muted">(latest 500)</span></h2></div>
-      <p class="muted" style="margin:-4px 0 14px">Run the password-free simulation to generate sample activity. Form and search values are excluded from these events.</p>
-      <form method="post" action="{{url_for('simulation')}}"><input type="hidden" name="csrf" value="{{session.csrf}}"><button class="btn">Start simulation</button></form>
+      <p class="muted" style="margin:-4px 0 14px">People who logged in with a trap username and believe they are inside the real Ops Console. Everything they did:</p>
       <div class="wrap"><table>
-      <tr><th>Time (UTC)</th><th>IP</th><th>Simulation account</th><th>Action</th><th>Detail</th></tr>
+      <tr><th>Time (UTC)</th><th>IP</th><th>Username used</th><th>Action</th><th>Detail</th><th>Browser</th></tr>
       {% for r in rows %}<tr><td>{{r.created_at.replace('T',' ')[:19]}}</td><td style="font-family:ui-monospace,monospace">{{r.ip}}</td>
         <td>{{r.username}}</td><td><span class="tag trap">{{r.action}}</span></td>
         <td style="white-space:normal;max-width:420px">{{r.detail}}</td>
-        </tr>
-      {% else %}<tr><td colspan="5" class="muted">No simulation activity yet.</td></tr>{% endfor %}
+        <td class="muted" title="{{r.user_agent}}">{{r.user_agent[:30]}}</td></tr>
+      {% else %}<tr><td colspan="6" class="muted">Nobody has fallen into the decoy yet.</td></tr>{% endfor %}
       </table></div></div>""", f"Decoy activity – {PRODUCT}", rows=rows)
 
 
@@ -1051,8 +990,10 @@ def add_user():
     msg = err = None
     if request.method == "POST":
         u, p = request.form.get("username", "").strip(), request.form.get("password", "")
-        if not 3 <= len(u) <= 100 or len(p) < 8:
-            err = "Username needs 3–100 characters and password 8+ characters."
+        if len(u) < 3 or len(p) < 8:
+            err = "Username needs 3+ characters and password 8+ characters."
+        elif u.lower() in HONEY_USERS:
+            err = f"'{u}' is a trap username (HONEY_USERS) – choose another."
         else:
             try:
                 db().execute("INSERT INTO users (username, password_hash) VALUES (?,?)",
@@ -1067,7 +1008,7 @@ def add_user():
        <div class="panel"><div class="ph"><h2>{{icon('plus',16)}} Add user</h2></div>
         {% if msg %}<div class="msg ok">{{msg}}</div>{% endif %}
         {% if err %}<div class="msg err">{{err}}</div>{% endif %}
-        <form method="post"><input type="hidden" name="csrf" value="{{session.csrf}}"><label class="muted">Username</label><input name="username" required>
+        <form method="post"><label class="muted">Username</label><input name="username" required>
         <label class="muted">Password (8+ characters)</label><input name="password" type="password" required>
         <button class="btn">Create user</button></form></div>
        <div class="panel"><div class="ph"><h2>{{icon('users',16)}} Accounts</h2></div><table>
@@ -1343,13 +1284,14 @@ def portal_search():
 @app.route("/portal/action/<what>")
 @decoy_required
 def portal_action(what):
+    target = request.args.get("target", "")
+    log_decoy(f"Clicked: {what}", target)
     msg = {"download": "Your download is being prepared. Large files are delivered to your email within 30 minutes.",
            "reset-password": "A password reset link has been sent to the user.",
            "restart": "Restart scheduled. The server will reboot during the next maintenance window.",
            "open-console": "Console session requested. Approval from a second administrator is required.",
            "export-report": "Report export started. You'll receive an email when it's ready.",
            }.get(what, "Your request has been submitted and is awaiting approval.")
-    log_decoy("Clicked simulated action")
     return decoy_page("Request submitted", "", """
       <div class="card" style="max-width:560px;margin:40px auto;text-align:center;padding:36px">
        <div style="width:56px;height:56px;border-radius:50%;background:#dcfce7;color:#16a34a;display:flex;align-items:center;justify-content:center;margin:0 auto 16px">{{icon('shield',26)}}</div>
@@ -1362,7 +1304,7 @@ def portal_action(what):
 @app.errorhandler(404)
 def not_found(_):
     if session.get("decoy"):
-        log_decoy("Opened unavailable page")
+        log_decoy("Tried hidden URL", request.path)
         return decoy_page("Not found", "", """
           <div class="card" style="max-width:520px;margin:40px auto;text-align:center;padding:36px">
            <h2 style="margin:0 0 8px">Page not found</h2><p class="muted">The page you requested does not exist or you don't have access.</p>
@@ -1379,47 +1321,21 @@ if ON_VERCEL:
     init_db()
 
 
-class LocalServer(ThreadedWSGIServer):
-    allow_reuse_address = os.name != "nt"
-
-    def server_bind(self):
-        if os.name == "nt":
-            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
-        super().server_bind()
-
-
-def main():
+if __name__ == "__main__":
+    init_db()
+    fill_missing_locations()
+    # HOST=127.0.0.1 (default): only this computer can open the site.
+    # HOST=0.0.0.0: other devices on the same Wi-Fi/network can open it too.
     host = os.environ.get("HOST", "127.0.0.1")
     port = int(os.environ.get("PORT", "5000"))
-    # Claim the address before changing the database, so an older server
-    # cannot silently continue serving the sign-in page.
-    try:
-        server = LocalServer(host, port, app)
-    except SystemExit:
-        print("Close the other server or choose a free PORT, then run setup again.")
-        raise
-    with server:
+    if host == "0.0.0.0":
+        import socket
         try:
-            if "--setup" in sys.argv:
-                while True:
-                    password = input("New admin password (12+ characters, visible): ")
-                    if len(password) >= 12:
-                        os.environ["ADMIN_PASSWORD"] = password
-                        del password
-                        break
-                    print("Enter at least 12 characters.")
-            changed = bool(os.environ.get("ADMIN_PASSWORD"))
-            init_db()
-        finally:
-            os.environ.pop("ADMIN_PASSWORD", None)
-
-        if changed:
-            print("Admin password saved. Username: admin.", flush=True)
-        print(f"Database: {os.path.abspath(DB_PATH)}", flush=True)
-        browser_host = "127.0.0.1" if host == "0.0.0.0" else host
-        print(f"Open http://{browser_host}:{server.server_port}/login", flush=True)
-        server.serve_forever()
-
-
-if __name__ == "__main__":
-    main()
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            lan_ip = s.getsockname()[0]
+            s.close()
+        except OSError:
+            lan_ip = "<this computer's IP>"
+        print(f"\n*** Other devices on the same network can open:  http://{lan_ip}:{port}\n")
+    app.run(host=host, port=port, debug=False)
