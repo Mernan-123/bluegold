@@ -801,7 +801,7 @@ def admin_data():
             hours[23 - hrs] += 1
     no_coords = q("SELECT COUNT(DISTINCT ip) FROM login_attempts WHERE lat IS NULL")
     return {"stats": stats, "places": places, "recent": recent, "attackers": attackers,
-            "hours": hours, "no_coords": no_coords, "labels": LABELS}
+            "hours": hours, "no_coords": no_coords, "geo_enabled": os.environ.get("IP_GEOLOCATION") == "1", "labels": LABELS}
 
 
 @app.route("/admin/api/feed")
@@ -841,6 +841,7 @@ def admin():
        const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
        const where = (...a) => a.filter(Boolean).map(esc).join(', ') || '—';
        const ago = iso => { const s=(Date.now()-new Date(iso))/1000; return s<60?Math.floor(s)+'s ago':s<3600?Math.floor(s/60)+'m ago':s<86400?Math.floor(s/3600)+'h ago':Math.floor(s/86400)+'d ago'; };
+       const attemptsUrl = {{url_for('logs')|tojson}};
        const ICON = {{icons|tojson}};
        const map = window.L ? L.map('map', {worldCopyJump:true, zoomControl:true}).setView([20,10], 2) : null;
        if (map) L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',
@@ -915,7 +916,8 @@ def admin():
          const onMap = new Set(map ? data.places.map(p => p.ip) : []);
          const KIND = {ok:'ok', bad:'bad', warn:'bad', trap:'trap'};   // feed tag -> map filter
          const ipAttr = (ip, cls) => onMap.has(ip) ? ` data-ip="${esc(ip)}"${cls ? ` data-f="${KIND[cls]}"` : ''} title="Show on map"` : '';
-         document.getElementById('nocoords').textContent = data.no_coords ? `${data.no_coords} IP(s) not on the map (local network or lookup failed).` : '';
+         document.getElementById('nocoords').textContent = !data.geo_enabled ? ' Location lookup is disabled. Set IP_GEOLOCATION=1 to map new public-IP attempts.' :
+           data.no_coords ? ` ${data.no_coords} source IP(s) have no coordinates.` : '' ;
          const col = {ok:'#22c55e',bad:'#ef4444',warn:'#f59e0b',trap:'#a78bfa'};
          document.getElementById('feed').innerHTML = data.recent.length ? data.recent.map(r => {
            const [lbl, cls] = data.labels[r.result] || ['Other', 'warn']; const isNew = !first && !seen.has(r.id);
@@ -931,7 +933,7 @@ def admin():
 
 
          document.getElementById('att').innerHTML = '<tr><th>IP address</th><th>Location</th><th>ISP</th><th>Attempts</th><th>Status</th><th>Last seen</th></tr>' +
-           (data.attackers.length ? data.attackers.map(a => `<tr${ipAttr(a.ip)}><td style="font-family:ui-monospace,monospace">${esc(a.ip)}</td><td>${where(a.city,a.country)}</td>
+           (data.attackers.length ? data.attackers.map(a => `<tr${ipAttr(a.ip)}><td style="font-family:ui-monospace,monospace"><a href="${attemptsUrl}?q=${encodeURIComponent(a.ip)}">${esc(a.ip)}</a></td><td>${where(a.city,a.country)}</td>
              <td>${esc((a.isp||'').slice(0,30))}</td><td><b>${a.n}</b></td><td>${a.trapped?'<span class="tag trap">Simulation</span>':'<span class="tag bad">Unsuccessful</span>'}</td><td class="muted">${ago(a.last_seen)}</td></tr>`).join('')
              : '<tr><td colspan="6" class="muted">No failed attempts yet.</td></tr>');
          first = false;
@@ -999,22 +1001,20 @@ def logs():
       <section class="ledger" aria-labelledby="attempt-results">
        <div class="ledger-head"><h2 id="attempt-results">Attempt history</h2><span class="muted">{{count}} matching {{'event' if count==1 else 'events'}}</span></div>
        <div class="wrap" tabindex="0" role="region" aria-label="Sign-in attempts table"><table>
-        <thead><tr><th scope="col">Timestamp (UTC)</th><th scope="col">Result</th><th scope="col">Username</th><th scope="col">IP address</th><th scope="col">Country</th><th scope="col">Region</th><th scope="col">City</th><th scope="col">Street</th><th scope="col">Map</th><th scope="col">ISP</th><th scope="col">MAC address</th><th scope="col">Reported browser / OS</th></tr></thead>
+        <thead><tr><th scope="col">Timestamp (UTC)</th><th scope="col">Result</th><th scope="col">Username</th><th scope="col">IP address</th><th scope="col">Country</th><th scope="col">Region</th><th scope="col">City</th><th scope="col">Street</th><th scope="col">ISP</th><th scope="col">MAC address</th><th scope="col">Reported browser / OS</th></tr></thead>
         <tbody>{% for r in rows %}<tr>
          <td><time datetime="{{r.created_at}}">{{r.created_at.replace('T',' ')[:19]}}</time></td>
          {% set label = labels.get(r.result, ('Other', 'warn')) %}
          <td><span class="tag {{label[1]}}">{{label[0]}}</span></td>
-         <td>{{r.username or 'Unidentified account'}}</td><td><code>{{r.ip or 'IP unavailable'}}</code></td>
+         <td>{{r.username or 'No matching account' if r.result == 'unknown_user' else 'Account not recorded'}}</td><td><code>{{r.ip or 'IP unavailable'}}</code></td>
          <td>{{r.country or 'Country unavailable'}}</td>
          <td>{{r.region or ('Local connection' if r.country == 'Local network' else 'Region unavailable')}}</td>
          <td>{{r.city or ('Local connection' if r.country == 'Local network' else 'City unavailable')}}</td>
          <td class="muted">Street not determined</td>
-         <td>{% if r.lat is number and r.lon is number %}<a class="audit-link" rel="noopener noreferrer" target="_blank"
-             href="https://www.openstreetmap.org/?mlat={{r.lat}}&mlon={{r.lon}}#map=11/{{r.lat}}/{{r.lon}}">Open map</a>{% else %}No coordinates{% endif %}</td>
          <td>{{r.isp or ('Local connection' if r.country == 'Local network' else 'Unavailable')}}</td>
          <td class="muted" title="Web requests do not include a device MAC address">Not sent by browser</td>
          <td>{{r.device or 'Not reported'}}</td>
-        </tr>{% else %}<tr><td colspan="12" class="empty">
+        </tr>{% else %}<tr><td colspan="11" class="empty">
         {% if query or outcome %}No attempts match these filters.{% else %}No sign-in attempts have been recorded yet.{% endif %}
         </td></tr>{% endfor %}</tbody>
        </table></div>
