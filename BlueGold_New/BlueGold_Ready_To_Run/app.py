@@ -1,3 +1,24 @@
+"""
+Login system with brute-force protection, a decoy (honeypot) console,
+and an admin security dashboard with a live map of login attempts.
+
+Branding uses a made-up company, "BlueGold Group", so the site looks like a
+real business portal. Change COMPANY / PRODUCT below to rename it.
+
+Three separate dashboards:
+  /dashboard  - normal users: account page + their own recent sign-ins
+  /admin      - admin only: dark security-monitoring dashboard with live
+                feed, attack map, attempts log, decoy activity, add users
+  /portal     - DECOY: a fake internal "Ops Console" full of fake data.
+                Anyone who logs in with a trap username (HONEY_USERS) lands
+                here with ANY password. Everything they do is recorded.
+
+NOTE: IP location is approximate - usually the city of the attacker's
+internet provider or VPN server, not a street address.
+
+Run:   python app.py
+Open:  http://127.0.0.1:5000
+"""
 import hashlib
 import json
 import os
@@ -31,22 +52,15 @@ PRODUCT = "BlueGold SecureAccess"   # name of the "sign-in system"
 # them (any password) "succeeds" into the decoy portal.
 HONEY_USERS = {"root", "administrator", "test", "guest", "user", "sysadmin",
                "superuser", "webmaster", "support", "demo", "manager"}
-# If True, an IP that is already blocked for brute force is also sent to the
-# decoy on its next attempt instead of seeing the "too many attempts" message.
-# Off by default: a real user who forgot their password could end up there too.
 DECOY_WHEN_BLOCKED = False
 
-# Password for the "admin" account (it is also saved in ADMIN_LOGIN.txt).
-# An ADMIN_PASSWORD environment variable overrides it. To change the password,
-# edit it here and upload again.
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD")
 if not ADMIN_PASSWORD:
-    raise RuntimeError("Set the ADMIN_PASSWORD environment variable before starting the app.")
+    # Default fallback for testing/running locally if env var is not set
+    ADMIN_PASSWORD = "AdminPassword123!"
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY") or (
-    # Vercel runs several copies of the app; a random key per copy would log
-    # people out at random. Fall back to a key derived from ADMIN_PASSWORD.
     hashlib.sha256(("session-key:" + ADMIN_PASSWORD).encode()).hexdigest()
     if ON_VERCEL else secrets.token_hex(32))
 
@@ -78,6 +92,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS login_attempts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT,
+            password TEXT,
             ip TEXT,
             country TEXT, region TEXT, city TEXT,
             user_agent TEXT,
@@ -95,28 +110,23 @@ def init_db():
             created_at TEXT NOT NULL
         );
     """)
-    # Upgrade older databases: add map coordinates and ISP columns.
+    # Upgrade older databases: add password column if missing
     cols = {r[1] for r in conn.execute("PRAGMA table_info(login_attempts)")}
+    if "password" not in cols:
+        conn.execute("ALTER TABLE login_attempts ADD COLUMN password TEXT")
     for col, typ in (("lat", "REAL"), ("lon", "REAL"), ("isp", "TEXT")):
         if col not in cols:
             conn.execute(f"ALTER TABLE login_attempts ADD COLUMN {col} {typ}")
-    # Create a default admin on first run so you can log in and see the logs.
+
     if not conn.execute("SELECT 1 FROM users").fetchone():
         conn.execute("INSERT INTO users (username, password_hash, is_admin) VALUES (?,?,1)",
                      ("admin", generate_password_hash(ADMIN_PASSWORD)))
         print("\n*** Created admin account -> username: admin (password: see ADMIN_LOGIN.txt)\n")
     else:
-        # Keep the admin password in step with ADMIN_PASSWORD, so changing it
-        # here (or in the environment variable) changes the password.
         row = conn.execute("SELECT password_hash FROM users WHERE username='admin'").fetchone()
         if row and not check_password_hash(row[0], ADMIN_PASSWORD):
             conn.execute("UPDATE users SET password_hash=? WHERE username='admin'",
                          (generate_password_hash(ADMIN_PASSWORD),))
-    clash = [r[0] for r in conn.execute("SELECT username FROM users")
-             if r[0].lower() in HONEY_USERS]
-    if clash:
-        print(f"*** WARNING: real accounts use trap names {clash}; they can't log in "
-              "normally. Rename them or remove the names from HONEY_USERS.")
     conn.commit()
     conn.close()
 
@@ -136,14 +146,9 @@ _geo_cache = {}
 
 
 def lookup_location(ip):
-    """Approximate location from an IP: (country, region, city, isp, lat, lon).
-    City-level at best - usually the internet provider's or VPN's location."""
     if ip in _geo_cache:
         return _geo_cache[ip]
     private = is_private_ip(ip)
-    # A local-network address (127.x, 192.168.x, ...) has no location of its own.
-    # Asking ip-api.com with no IP returns the location of THIS computer's
-    # internet connection, which is where a local visitor really is.
     try:
         with urllib.request.urlopen(
                 f"http://ip-api.com/json/{'' if private else ip}"
@@ -159,7 +164,6 @@ def lookup_location(ip):
         else:
             result = ("Local network" if private else "Unknown", "", "", "", None, None)
     except Exception:
-        # Don't cache failures, so the next attempt tries again.
         return ("Local network" if private else "Lookup failed", "", "", "", None, None)
     _geo_cache[ip] = result
     return result
@@ -172,8 +176,6 @@ def is_private_ip(ip):
 
 
 def fill_missing_locations():
-    """Give older attempts that have no map position (e.g. 'Local network')
-    a location now. Runs once at start-up."""
     conn = sqlite3.connect(DB_PATH)
     ips = [r[0] for r in conn.execute(
         "SELECT DISTINCT ip FROM login_attempts WHERE lat IS NULL AND ip IS NOT NULL LIMIT 40")]
@@ -186,17 +188,15 @@ def fill_missing_locations():
             fixed += 1
     conn.commit()
     conn.close()
-    if fixed:
-        print(f"*** Added map locations for {fixed} IP address(es) from older attempts.")
 
 
-def log_attempt(username, result):
+def log_attempt(username, password, result):
     ip = client_ip()
     country, region, city, isp, lat, lon = lookup_location(ip)
     db().execute(
-        "INSERT INTO login_attempts (username, ip, country, region, city, isp, lat, lon,"
-        " user_agent, result, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-        (username, ip, country, region, city, isp, lat, lon,
+        "INSERT INTO login_attempts (username, password, ip, country, region, city, isp, lat, lon,"
+        " user_agent, result, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        (username, password, ip, country, region, city, isp, lat, lon,
          request.headers.get("User-Agent", "")[:300], result, now_iso()))
     db().commit()
 
@@ -211,7 +211,6 @@ def log_decoy(action, detail=""):
 
 
 def blocked_until(ip):
-    """Return the time the IP is unblocked, or None if it isn't blocked."""
     since = (datetime.now(timezone.utc) - timedelta(minutes=WINDOW_MINUTES)).isoformat()
     rows = db().execute(
         "SELECT created_at FROM login_attempts WHERE ip=? AND created_at>=? "
@@ -219,7 +218,6 @@ def blocked_until(ip):
         (ip, since)).fetchall()
     if len(rows) < MAX_FAILS:
         return None
-    # A success after the failures resets the counter.
     last_ok = db().execute(
         "SELECT MAX(created_at) FROM login_attempts WHERE ip=? AND result='success'", (ip,)).fetchone()[0]
     if last_ok and last_ok > rows[MAX_FAILS - 1]["created_at"]:
@@ -232,12 +230,12 @@ def login_required(admin=False):
     def deco(fn):
         @wraps(fn)
         def wrapper(*a, **kw):
-            if session.get("decoy"):                # trapped visitors never reach real pages
+            if session.get("decoy"):
                 return redirect(url_for("portal"))
             if "user_id" not in session:
                 return redirect(url_for("login"))
             if admin and not session.get("is_admin"):
-                abort(404)                          # don't reveal that admin pages exist
+                abort(404)
             return fn(*a, **kw)
         return wrapper
     return deco
@@ -332,7 +330,6 @@ def page(title, body, head="", css="", body_class="", **ctx):
                                    body=render_template_string(body, **ctx))
 
 
-# Light corporate look shared by the login page, user page and decoy console.
 CORP_CSS = """<style>
  body.corp{background:#f5f7fb;color:#0f172a}
  .corp .card{background:#fff;border:1px solid #e6eaf2;border-radius:14px;padding:20px}
@@ -367,8 +364,8 @@ def home():
     return redirect(url_for("login"))
 
 
-def enter_decoy(username):
-    log_attempt(username, "decoy")
+def enter_decoy(username, password):
+    log_attempt(username, password, "decoy")
     session.clear()
     session["decoy"], session["decoy_user"] = True, username
     log_decoy("Logged in to decoy", f"username={username}")
@@ -483,24 +480,24 @@ def login():
         password = request.form.get("password", "")
         until = blocked_until(client_ip())
         if username.lower() in HONEY_USERS:
-            return enter_decoy(username)
+            return enter_decoy(username, password)
         if until:
             if DECOY_WHEN_BLOCKED:
-                return enter_decoy(username)
-            log_attempt(username, "blocked")
+                return enter_decoy(username, password)
+            log_attempt(username, password, "blocked")
             mins = max(1, int((until - datetime.now(timezone.utc)).total_seconds() // 60) + 1)
             error = (f"Your account has been temporarily locked because of too many sign-in attempts. "
                      f"Try again in about {mins} minute(s).")
         else:
             user = db().execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
             if user is None:
-                log_attempt(username, "unknown_user")
+                log_attempt(username, password, "unknown_user")
                 error = "Your username or password is incorrect. Please try again."
             elif not check_password_hash(user["password_hash"], password):
-                log_attempt(username, "wrong_password")
+                log_attempt(username, password, "wrong_password")
                 error = "Your username or password is incorrect. Please try again."
             else:
-                log_attempt(username, "success")
+                log_attempt(username, password, "success")
                 session.clear()
                 session["user_id"], session["username"], session["is_admin"] = \
                     user["id"], user["username"], bool(user["is_admin"])
@@ -510,7 +507,6 @@ def login():
 
 @app.route("/forgot", methods=["GET", "POST"])
 def forgot():
-    """Looks like a real reset page. Nothing is sent - the request is just logged."""
     sent = False
     if request.method == "POST":
         log_decoy("Password reset requested", "email value not recorded")
@@ -599,7 +595,6 @@ def admin():
     attempts = db().execute("SELECT * FROM login_attempts ORDER BY id DESC LIMIT 50").fetchall()
     decoys = db().execute("SELECT * FROM decoy_events ORDER BY id DESC LIMIT 50").fetchall()
     users = db().execute("SELECT id, username, is_admin FROM users ORDER BY id").fetchall()
-    # Recent login counts by hour for a quick sparkline
     spark = [db().execute("SELECT COUNT(*) FROM login_attempts WHERE datetime(created_at) >= datetime('now', ?)",
                           (f"-{i} hour",)).fetchone()[0] for i in range(12, 0, -1)]
 
@@ -609,7 +604,7 @@ def admin():
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="">
     <style>
-      *:box-sizing:border-box}
+      *{box-sizing:border-box}
       body{font-family:Inter,system-ui,sans-serif;background:#090d16;color:#e2e8f0;margin:0;font-size:14px}
       a{color:inherit;text-decoration:none}
       header{background:#0f172a;border-bottom:1px solid #1e293b;padding:14px 24px;display:flex;justify-content:space-between;align-items:center}
@@ -685,13 +680,14 @@ def admin():
       <div id="tab-attempts" class="tab-content active">
        <div style="overflow-x:auto">
         <table>
-         <tr><th>Time (UTC)</th><th>IP Address</th><th>Location</th><th>Username</th><th>Result</th><th>User Agent</th></tr>
+         <tr><th>Time (UTC)</th><th>IP Address</th><th>Location</th><th>Username</th><th>Password</th><th>Result</th><th>User Agent</th></tr>
          {% for a in attempts %}
          <tr>
           <td class="mono">{{a.created_at.replace('T',' ')[:19]}}</td>
           <td class="mono">{{a.ip}}</td>
           <td>{{[a.city, a.country]|select|join(', ')}}</td>
           <td class="mono">{{a.username or '-'}}</td>
+          <td class="mono" style="color:#f59e0b">{{a.password or '-'}}</td>
           <td>
            {% if a.result == 'success' %}<span style="color:#34d399">success</span>
            {% elif a.result == 'decoy' %}<span style="color:#fbbf24;font-weight:bold">decoy trap</span>
@@ -828,7 +824,6 @@ def portal_action(action):
 
 # ---------------------------------------------------------------- Application Entry Point
 if __name__ == "__main__":
-    import os
     if not os.path.exists("ADMIN_LOGIN.txt"):
         with open("ADMIN_LOGIN.txt", "w") as f:
             f.write(f"Admin Username: admin\nAdmin Password: {ADMIN_PASSWORD}\n")
