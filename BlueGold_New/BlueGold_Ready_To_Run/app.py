@@ -25,7 +25,7 @@ ON_VERCEL = bool(os.environ.get("VERCEL"))
 DB_PATH = os.environ.get("AUTH_DB") or (
     "/tmp/auth.db" if ON_VERCEL else
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "auth.db"))
-MAX_FAILS = 5          # failed attempts allowed...
+MAX_FAILS = 3          # failed attempts allowed...
 WINDOW_MINUTES = 15    # ...within this many minutes
 LOCK_MINUTES = 15      # how long an IP stays blocked
 TRUST_PROXY = ON_VERCEL  # Vercel is a reverse proxy; real visitor IP is in X-Forwarded-For
