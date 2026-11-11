@@ -56,3 +56,6 @@ by the provider. This update does not backfill previous attempts.
 
 New attempts record a browser and OS label when detectable. The raw browser
 header is excluded. These labels are client-reported and may be inaccurate.
+Set ADMIN_PASSWORD and SECRET_KEY in Vercel's Production environment.
+After deployment, open /login and sign in as admin.
+
